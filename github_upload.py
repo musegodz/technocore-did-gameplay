@@ -14,16 +14,70 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import fnmatch
 import subprocess
 import sys
-import time
 import urllib.request
 
 API = "https://api.github.com"
 
+# Files that must never be uploaded, even if .gitignore is missing or wrong.
+# This helper is meant to run in the folder that holds the DID identity,
+# so it cannot rely on .gitignore alone.
+SENSITIVE_PATTERNS = (
+    "*.pem",
+    "*.key",
+    "*.secret",
+    "passphrase*",
+    "identity.pem",
+    ".env",
+    ".env.*",
+    "hosts.yml",
+    ".git-credentials",
+)
+SENSITIVE_EXCEPTIONS = {".env.example", ".env.sample"}
 
-def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+def run(cmd: list[str], check: bool = True, cwd: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, cwd=cwd)
+
+
+def find_sensitive_files(names) -> list[str]:
+    """Return the staged paths that look like secrets / private identity files."""
+    hits = []
+    for name in names:
+        base = os.path.basename(name)
+        if base in SENSITIVE_EXCEPTIONS:
+            continue
+        if any(fnmatch.fnmatch(base, pattern) for pattern in SENSITIVE_PATTERNS):
+            hits.append(name)
+    return hits
+
+
+def ensure_no_sensitive_tracked(workdir: str) -> None:
+    """Abort if a sensitive file is already tracked in workdir's git repo."""
+    r = run(["git", "ls-files"], check=False, cwd=workdir)
+    if r.returncode != 0:
+        return  # not a git repo yet — the staged check will cover it
+    hits = find_sensitive_files([line for line in r.stdout.splitlines() if line.strip()])
+    if hits:
+        raise RuntimeError(
+            "sensitive file(s) already tracked by git: " + ", ".join(sorted(hits))
+            + " — remove them from history before uploading"
+        )
+
+
+def ensure_no_sensitive_staged(workdir: str) -> None:
+    """Abort (after unstaging) if `git add -A` staged a sensitive file."""
+    r = run(["git", "diff", "--cached", "--name-only"], check=False, cwd=workdir)
+    staged = [line for line in r.stdout.splitlines() if line.strip()]
+    hits = find_sensitive_files(staged)
+    if hits:
+        run(["git", "reset"], check=False, cwd=workdir)
+        raise RuntimeError(
+            "refusing to upload sensitive file(s): " + ", ".join(sorted(hits))
+            + " — remove them / fix .gitignore, then re-run"
+        )
 
 
 def have_gh() -> bool:
@@ -51,7 +105,7 @@ def token_username(token: str) -> str:
         return json.loads(resp.read())["login"]
 
 
-def create_repo_api(token: str, name: str, private: bool, description: str) -> str:
+def create_repo_api(token: str, name: str, private: bool, description: str) -> str | None:
     body = json.dumps({
         "name": name,
         "private": private,
@@ -75,19 +129,28 @@ def create_repo_api(token: str, name: str, private: bool, description: str) -> s
 
 
 def push_with_token(token: str, repo_full: str, name: str, branch: str, workdir: str) -> str:
-    """Push via token-embedded URL (works without gh)."""
+    """Push using the token for this push only (works without gh).
+
+    The token is passed as a one-shot push URL and is never written into
+    .git/config: `origin` is always the clean, token-free URL.
+    """
     subprocess.run(["git", "init", "-b", branch], cwd=workdir, check=True, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True, capture_output=True)
-    # Only commit if there are changes
-    r = run(["git", "diff", "--cached", "--quiet"], check=False)
+    ensure_no_sensitive_staged(workdir)
+    # Only commit if there are changes (in workdir, not the caller's cwd)
+    r = run(["git", "diff", "--cached", "--quiet"], check=False, cwd=workdir)
     if r.returncode != 0:
         subprocess.run(["git", "commit", "-m", f"Technocore contribution: {name}"],
                        cwd=workdir, check=True, capture_output=True)
-    remote_url = f"https://x-access-token:{token}@github.com/{repo_full}.git"
+    clean_url = f"https://github.com/{repo_full}.git"
     subprocess.run(["git", "remote", "remove", "origin"], cwd=workdir, check=False, capture_output=True)
-    subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=workdir, check=True, capture_output=True)
-    subprocess.run(["git", "push", "-u", "origin", branch], cwd=workdir, check=True, capture_output=True)
-    r = run(["git", "rev-parse", "HEAD"], check=False)
+    subprocess.run(["git", "remote", "add", "origin", clean_url], cwd=workdir, check=True, capture_output=True)
+    push_url = f"https://x-access-token:{token}@github.com/{repo_full}.git"
+    subprocess.run(["git", "push", push_url, f"{branch}:{branch}"],
+                   cwd=workdir, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "--set-upstream-to", f"origin/{branch}", branch],
+                   cwd=workdir, check=False, capture_output=True)
+    r = run(["git", "rev-parse", "HEAD"], check=False, cwd=workdir)
     return r.stdout.strip()
 
 
@@ -95,15 +158,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Auto-upload a Technocore contribution to GitHub.")
     parser.add_argument("name", help="repository name (e.g. technocore-did-gameplay)")
     parser.add_argument("--private", action="store_true", help="create a private repo (default: public)")
+    parser.add_argument("--public", action="store_true",
+                        help="create a public repo (the default; accepted for README compatibility)")
     parser.add_argument("--description", default="Technocore DID contribution", help="repo description")
     parser.add_argument("--branch", default="main")
     parser.add_argument("--dir", default=".", help="directory to upload (default: current)")
     args = parser.parse_args()
 
+    if args.private and args.public:
+        parser.error("--private and --public are mutually exclusive")
     workdir = os.path.abspath(args.dir)
     branch = args.branch
 
     try:
+        ensure_no_sensitive_tracked(workdir)
         token = os.environ.get("GITHUB_TOKEN", "")
         if have_gh():
             username = gh_username()
@@ -118,7 +186,8 @@ def main() -> int:
                     raise RuntimeError("gh repo create failed")
                 subprocess.run(["git", "init", "-b", branch], cwd=workdir, check=True, capture_output=True)
                 subprocess.run(["git", "add", "-A"], cwd=workdir, check=True, capture_output=True)
-                rc = run(["git", "diff", "--cached", "--quiet"], check=False)
+                ensure_no_sensitive_staged(workdir)
+                rc = run(["git", "diff", "--cached", "--quiet"], check=False, cwd=workdir)
                 if rc.returncode != 0:
                     subprocess.run(["git", "commit", "-m", f"Technocore contribution: {args.name}"],
                                    cwd=workdir, check=True, capture_output=True)
@@ -127,7 +196,7 @@ def main() -> int:
                                 f"https://github.com/{username}/{args.name}.git"],
                                cwd=workdir, check=True, capture_output=True)
                 subprocess.run(["git", "push", "-u", "origin", branch], cwd=workdir, check=True, capture_output=True)
-            commit = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+            commit = run(["git", "rev-parse", "HEAD"], cwd=workdir).stdout.strip()
             print(f"repo:    https://github.com/{username}/{args.name}")
             print(f"commit:  {commit}")
             return 0

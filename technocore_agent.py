@@ -169,12 +169,13 @@ def create_identity(path: Path = KEY_PATH, passphrase: str | None = None) -> str
         raise IdentityError(f"identity already exists: {path}")
     if passphrase is None:
         passphrase = getpass.getpass("New identity passphrase (12+ chars): ")
-    if len(passphrase) < 12:
-        raise IdentityError("passphrase must be at least 12 characters")
-    if passphrase is None:
+        if len(passphrase) < 12:
+            raise IdentityError("passphrase must be at least 12 characters")
         confirm = getpass.getpass("Confirm passphrase: ")
         if passphrase != confirm:
             raise IdentityError("passphrases do not match")
+    elif len(passphrase) < 12:
+        raise IdentityError("passphrase must be at least 12 characters")
     pk = Ed25519PrivateKey.generate()
     private_bytes = pk.private_bytes(
         serialization.Encoding.PEM,
@@ -196,7 +197,12 @@ def load_identity(path: Path = KEY_PATH, passphrase: str | None = None) -> Ed255
     except TypeError:
         if passphrase is None:
             passphrase = getpass.getpass(f"Passphrase for {path}: ")
-        return serialization.load_pem_private_key(private_bytes, password=passphrase.encode())
+        try:
+            return serialization.load_pem_private_key(private_bytes, password=passphrase.encode())
+        except ValueError:
+            raise IdentityError("incorrect passphrase, or the key file is corrupted") from None
+    except ValueError:
+        raise IdentityError("key file is not a valid PEM private key") from None
 
 
 # ---------------------------------------------------------------------------
@@ -268,14 +274,23 @@ def verify_contribution_proof(proof: dict) -> None:
     for key in ("artifact_url", "commit", "did", "signature"):
         if not proof.get(key):
             raise ProtocolError(f"proof missing field: {key}")
+    if proof.get("schema") is not None and proof["schema"] != "technocore-contribution-proof-v1":
+        raise ProtocolError(f"unknown proof schema: {proof['schema']}")
+    if not str(proof["artifact_url"]).startswith(("https://", "http://")):
+        raise ProtocolError("proof artifact_url must be an http(s) URL")
     if COMMIT_PATTERN.fullmatch(str(proof["commit"])) is None:
         raise ProtocolError("proof has invalid commit")
+    if SIGNATURE_PATTERN.fullmatch(str(proof["signature"])) is None:
+        raise ProtocolError("proof signature must be 86 base64url characters")
     payload = f"{proof['artifact_url']}|{proof['commit']}".encode()
-    raw_sig = base64.urlsafe_b64decode(proof["signature"] + "==")
+    try:
+        raw_sig = base64.urlsafe_b64decode(proof["signature"] + "==")
+    except ValueError:
+        raise ProtocolError("proof signature is not valid base64url") from None
     try:
         public_key_from_did(proof["did"]).verify(raw_sig, payload)
-    except (InvalidSignature, ValueError):
-        raise IdentityError("signature does not match the DID and payload")
+    except InvalidSignature:
+        raise IdentityError("signature does not match the DID and payload") from None
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +339,9 @@ def main(argv=None) -> int:
 
     try:
         pf = args.passphrase_file if hasattr(args, 'passphrase_file') and args.passphrase_file else None
-        pphrase = pf.read_text().strip() if pf else None
+        # Only the trailing newline(s) are file framing — a passphrase may
+        # legitimately start or end with spaces, so do not .strip() it.
+        pphrase = pf.read_text().rstrip("\r\n") if pf else None
 
         if args.command == "init":
             did = create_identity(passphrase=pphrase)

@@ -129,6 +129,13 @@ a video, an article. The proof binds your DID to a specific artifact.
 
 5. Commit `proof.json` to your repo so the evidence is public.
 
+> **What a proof actually binds:** the commit hash *named inside*
+> `proof.json` — not the commit that adds the proof file itself (a file
+> cannot contain its own commit's hash). After later content commits, the
+> proof describes an ancestor commit until you re-run `proof` for the new
+> hash and commit that update. Check with `git log --oneline` which commit
+> your current proof covers.
+
 #### Path B — Any public content (X thread, article, video)
 
 ```bash
@@ -160,7 +167,12 @@ python github_upload.py REPO_NAME --public
 ```
 
 The script creates the repository, uploads the current directory, and prints
-the repo URL and commit hash — ready for `proof`.
+the repo URL and commit hash — ready for `proof`. (`--public` is accepted and
+is the default; use `--private` for a private repo.) The upload helper
+refuses to stage or push files that look like secrets (`*.pem`, `*.key`,
+`passphrase*`, `.env`, …) even if `.gitignore` is missing, and a
+`GITHUB_TOKEN` is used only for that one push — it is never written into
+`.git/config`.
 
 ### Security
 
@@ -354,6 +366,13 @@ thread X, video, artikel. Proof mengikat DID lu ke artefak tertentu.
    ```
 
 5. Commit `proof.json` ke repo lu biar buktinya publik.
+
+> **Proof itu mengikat apa:** commit hash *yang tertulis di dalam*
+> `proof.json` — bukan commit yang menambahkan file proof itu sendiri
+> (sebuah file gak bisa berisi hash commit-nya sendiri). Setelah ada commit
+> konten baru, proof lu mendeskripsikan commit leluhur (ancestor) sampai lu
+> jalanin `proof` lagi buat hash baru dan commit update-nya. Cek pakai
+> `git log --oneline` commit mana yang lagi di-cover proof lu.
 
 #### Jalur B — Konten publik apa pun (thread X, artikel, video)
 
